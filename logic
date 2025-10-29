@@ -1,0 +1,7 @@
+The model predicts flood probability, impact, and resilience in Mumbai based on:
+Forecasted rainfall
+Terrain vulnerability (elevation, slope, NDVI, urban cover, distance to water)
+Human vulnerability (population density, shelter access, infrastructure)
+Heuristic flood behavior (physics-inspired weighting)
+The goal:
+Instead of just saying “this area will flood,” it answers “how badly, how fast, and how ready are the people?”

@@ -1,0 +1,288 @@
+// FLOWSENSE prototype — Mumbai dynamic flood risk + resilience + time-to-evacuate
+// Paste this into Google Earth Engine Code Editor.
+// === NOTES ===
+// - This script assumes you will upload forecast images (rainfall) as ee.Image assets
+//   named 'users/yourname/forecast_day0', '.../forecast_day1', etc. OR you can use CHIRPS proxy.
+// - Replace trainingPoints (dummy) with real historical flood event points to train the model.
+// - Replace sheltersFC with real shelter locations (FeatureCollection) for accurate resilience/time-to-evacuate.
+
+// --------------- 0. Define ROI: Mumbai approx bbox ---------------
+var roi = ee.Geometry.Rectangle([72.70, 18.85, 73.15, 19.35]);
+Map.centerObject(roi, 11);
+
+// --------------- 1. Load static layers ---------------
+// Elevation and slope
+var elev = ee.Image('USGS/SRTMGL1_003').clip(roi).rename('elevation');
+var slope = ee.Terrain.slope(elev).rename('slope');
+
+// Land cover (MODIS IGBP)
+var modis = ee.ImageCollection('MODIS/051/MCD12Q1')
+              .filter(ee.Filter.date('2019-01-01','2022-12-31'))
+              .first()
+              .select('Land_Cover_Type_1').clip(roi);
+
+// Urban fraction (MODIS class 13 = Urban)
+var urbanMask = modis.eq(13).rename('urban_mask');
+var urbanFrac = urbanMask.reduceNeighborhood({
+  reducer: ee.Reducer.mean(), kernel: ee.Kernel.square({radius:3, units:'pixels'})
+}).rename('urban_frac');
+
+// NDVI (Sentinel-2 median recent)
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+          .filterBounds(roi)
+          .filterDate('2024-04-01','2024-10-01')
+          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+          .map(function(img){ return img.normalizedDifference(['B8','B4']).rename('ndvi'); })
+          .median()
+          .clip(roi);
+
+// Population density - WorldPop or GPW (if available in your assets) - use 'WorldPop' available via GEE
+// If not available, set a placeholder constant.
+var pop = ee.Image('WorldPop/GP/100m/pop')  // may require asset availability; replace if not present
+           .select('population').clip(roi)
+           .rename('population');
+
+// Distance to nearest permanent water (use JRC Global Surface Water mask)
+var water = ee.Image('JRC/GSW1_0/GlobalSurfaceWater').select('occurrence').gt(0).clip(roi);
+var waterDist = water.not().distance(30).rename('dist_to_water'); // meters
+
+// Distance to coastline (approx use water occurrence)
+var coastDist = water.not().distance(30).rename('dist_to_coast');
+
+// --------------- 2. Forecast rainfall input (placeholder logic) ---------------
+// Option A: load your pre-uploaded forecast images for each forecast day.
+// Example asset names: 'users/yourname/forecast_day0' etc.
+// Uncomment and set your own asset paths if you have forecast rasters.
+// var forecastDay0 = ee.Image('users/yourname/forecast_day0').clip(roi).rename('rain_day0');
+// var forecastDay1 = ee.Image('users/yourname/forecast_day1').clip(roi).rename('rain_day1');
+// var forecastDay2 = ee.Image('users/yourname/forecast_day2').clip(roi).rename('rain_day2');
+
+// Option B: Quick proxy — use recent CHIRPS sum over last 3 days as "day0" forecast
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterBounds(roi);
+var today = ee.Date(Date.now());
+var proxyDay0 = chirps.filterDate(today.advance(-3, 'day'), today).sum().clip(roi).rename('rain_day0');
+var proxyDay1 = proxyDay0.multiply(0.9).rename('rain_day1'); // simple decay proxy
+var proxyDay2 = proxyDay0.multiply(0.7).rename('rain_day2');
+
+// Use proxy if forecast assets not defined
+var forecastDay0 = proxyDay0;
+var forecastDay1 = proxyDay1;
+var forecastDay2 = proxyDay2;
+
+// Stack forecast bands for convenience
+var forecastStack = forecastDay0.addBands([forecastDay1, forecastDay2])
+                    .select(['rain_day0', 'rain_day1', 'rain_day2']);
+
+// --------------- 3. Feature stack for model (static + forecast) ---------------
+function makeFeatureImage(rainImage){
+  // Input: rainImage is ee.Image with bands rain_day0, rain_day1, rain_day2
+  var meanForecast = rainImage.reduce(ee.Reducer.mean()).rename('rain_mean3');
+  var maxForecast = rainImage.reduce(ee.Reducer.max()).rename('rain_max3');
+  var recentRain = rainImage.select('rain_day0').rename('rain_recent');
+
+  var feat = elev.addBands([slope, urbanFrac, ndvi, meanForecast, maxForecast, recentRain, pop, waterDist, coastDist])
+                 .select(['elevation','slope','urban_frac','ndvi','rain_mean3','rain_max3','rain_recent','population','dist_to_water','dist_to_coast'])
+                 .clip(roi);
+  return feat;
+}
+
+var featureImage = makeFeatureImage(forecastStack);
+
+// Visual checks
+Map.addLayer(featureImage.select('rain_recent'), {min:0, max:200, palette:['white','blue']}, 'rain_recent');
+Map.addLayer(featureImage.select('elevation'), {min:0, max:200, palette:['white','green']}, 'elevation');
+Map.addLayer(featureImage.select('urban_frac'), {min:0, max:1, palette:['white','darkred']}, 'urban_frac');
+
+// --------------- 4. Training data (replace with your real flood labels!) ---------------
+// Dummy training points — MUST replace with real labeled flood occurrence (flood prob or binary flag)
+var trainingPoints = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([72.85,19.05]), {flood:1}),
+  ee.Feature(ee.Geometry.Point([73.00,19.20]), {flood:0}),
+  ee.Feature(ee.Geometry.Point([72.90,18.95]), {flood:0}),
+  // add more labeled points...
+]).map(function(f){ return f.set('id', ee.Number(f.id())); });
+
+// Sample features at those points
+var sampled = featureImage.sampleRegions({
+  collection: trainingPoints,
+  properties: ['flood'],
+  scale: 30,
+  geometries: true
+});
+
+// --------------- 5. Train a Gradient Boosting regressor (proxy for FloodProbability) ---------------
+var inputBands = ['elevation','slope','urban_frac','ndvi','rain_mean3','rain_max3','rain_recent','population','dist_to_water','dist_to_coast'];
+
+// If 'flood' is binary, train classifier. If continuous probabilities available, train regressor.
+// We'll train a classifier returning 0/1 probability, then convert to probability.
+var classifier = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 80,
+  learningRate: 0.1,
+  maxNodes: 20
+}).train({
+  features: sampled,
+  classProperty: 'flood',
+  inputProperties: inputBands
+});
+
+// Predict probability: use classify then get probability via predict probabilities if supported
+var classified = featureImage.classify(classifier).rename('flood_class');
+Map.addLayer(classified, {min:0, max:1, palette:['white','red']}, 'flood_class (binary)');
+
+// GEE returns discrete 0/1 for classify; approximate probability with trees voting (not exact).
+// For a better probability, you can train a regressor using flood frequency; or export features and run LightGBM externally.
+
+// --------------- 6. Heuristic flood risk score (continuous) ---------------
+// Create a continuous risk score combining rainfall and vulnerability heuristics (useful if classifier is coarse)
+var rainScore = featureImage.select('rain_recent').unitScale(0, 200).clamp(0,1);  // normalize recent daily rainfall to 0-1
+var elevScore = featureImage.select('elevation').unitScale(200, 0);               // low elevation -> higher risk (inverted)
+var slopeScore = featureImage.select('slope').unitScale(0, 30).multiply(-1).add(1); // low slope -> higher stagnation risk
+var urbanScore = featureImage.select('urban_frac'); // higher urban -> likely higher runoff
+var nearWaterScore = featureImage.select('dist_to_water').unitScale(1000, 0).clamp(0,1); // closer to water -> higher
+
+// Combine into heuristic risk (weights chosen for demo)
+var heuristicRisk = rainScore.multiply(0.45)
+                  .add(elevScore.multiply(0.2))
+                  .add(urbanScore.multiply(0.15))
+                  .add(nearWaterScore.multiply(0.2))
+                  .rename('heuristicRisk')
+                  .clamp(0,1);
+
+Map.addLayer(heuristicRisk, {min:0, max:1, palette:['blue','yellow','red']}, 'heuristicRisk (0-1)');
+
+// Prefer combining model output (classifier) and heuristic to get final FloodRisk
+// Convert binary classification into continuous proxy by smoothing with heuristic:
+var floodProb = heuristicRisk.multiply(0.6).add(classified.multiply(0.4)).rename('floodProb').clamp(0,1);
+Map.addLayer(floodProb, {min:0, max:1, palette:['blue','yellow','red']}, 'Flood Probability (0-1)');
+
+// --------------- 7. Resilience Index (0-1) ---------------
+// Components: population density (higher pop => lower resilience), distance to shelters (closer => higher resilience),
+// road density (# roads per area) — we approximate road density via OpenStreetMap roads if available, else use urban fract.
+// For demo: Resilience = w1*(1 - pop_norm) + w2*(shelter_access) + w3*(road_proxy)
+var popNorm = featureImage.select('population').unitScale(0, 5000).clamp(0,1); // normalize
+var popScore = popNorm.multiply(-1).add(1); // higher pop => lower resilience
+
+// Shelters: placeholder FeatureCollection (replace with real shelters)
+var sheltersFC = ee.FeatureCollection([
+  ee.Feature(ee.Geometry.Point([72.85,19.05]), {name: 'Shelter A'}),
+  ee.Feature(ee.Geometry.Point([72.98,19.10]), {name: 'Shelter B'}),
+  // add real shelters...
+]);
+
+// distance to nearest shelter (meters)
+var sheltersRaster = ee.Image().toByte().paint(sheltersFC, 1).clip(roi);
+var distToShelter = sheltersRaster.not().distance(30).rename('dist_to_shelter');
+var shelterScore = distToShelter.unitScale(5000,0).clamp(0,1); // closer => higher score
+
+// road proxy: use urban_frac as a rough proxy (more urban => more roads)
+var roadProxy = featureImage.select('urban_frac');
+
+// Compose resilience (weights)
+var resilience = popScore.multiply(0.45).add(shelterScore.multiply(0.35)).add(roadProxy.multiply(0.20)).rename('resilience').clamp(0,1);
+Map.addLayer(resilience, {min:0, max:1, palette:['red','yellow','green']}, 'Resilience (0-1)');
+
+// --------------- 8. Impact Score ---------------
+var impact = floodProb.multiply(ee.Image(1).subtract(resilience)).rename('impact').clamp(0,1);
+Map.addLayer(impact, {min:0, max:1, palette:['white','orange','red']}, 'Impact Score (0-1)');
+
+// --------------- 9. Time-to-evacuate heuristic ---------------
+// We calculate two things:
+// A) travel_time_to_shelter = distance_to_shelter / (k * sqrt(slope + eps)). choose k=3 (m/s per sqrt-deg)
+// B) rainfall_threshold_time = estimated hours until cumulative forecast rain reaches threshold
+// Then time_to_evacuate = min(travel_time, rainfall_threshold_time) maybe minus safety buffer.
+
+// Compute travel speed proxy
+var k = ee.Number(3.0); // tuning parameter; adjust higher for faster ppl or better roads
+var slopeImg = featureImage.select('slope').expression('b(0) + 0.001', { '0': featureImage.select('slope') }); // avoid zero
+var travelSpeed = slopeImg.sqrt().multiply(k).rename('travelSpeed'); // m/s
+
+// travel_time (hours) = distance (m) / speed (m/s) / 3600
+var travelTimeHours = distToShelter.divide(travelSpeed).divide(3600).rename('travelTime_h');
+Map.addLayer(travelTimeHours, {min:0, max:6}, 'Travel time to shelter (h)');
+
+// rainfall threshold time: we assume flood threshold is X mm accumulated; compute cumulative forecast per day and estimate hours.
+// For demo assume threshold = 50 mm in 24 hours.
+var threshold = ee.Number(50); // mm
+// Here forecastDay0 etc. are daily totals (mm). So if day0 >= threshold then 0-24 hours.
+var rain0 = forecastStack.select('rain_day0');
+var rain1 = forecastStack.select('rain_day1');
+var rain2 = forecastStack.select('rain_day2');
+var cumulDay0 = rain0;
+var cumulDay1 = rain0.add(rain1);
+var cumulDay2 = rain0.add(rain1).add(rain2);
+
+// Estimate threshold crossing day and convert to hours (simple)
+var thresholdCrossHours = cumulDay0.gte(threshold).multiply(12) // if day0 exceeded -> ~12 hours
+  .add(cumulDay1.gte(threshold).and(cumulDay0.lt(threshold)).multiply(36)) // day1 -> ~36 hours
+  .add(cumulDay2.gte(threshold).and(cumulDay1.lt(threshold)).and(cumulDay0.lt(threshold)).multiply(60))
+  .rename('thresholdCrossHours'); // approximate hours until threshold
+
+// Combine into advised evacuation hours: earliest of travelTimeHours and thresholdCrossHours, minus buffer (2 hours)
+var buffer = ee.Number(2);
+var advisedEvacHours = travelTimeHours.min(thresholdCrossHours).subtract(buffer).max(ee.Number(0)).rename('evac_hours');
+Map.addLayer(advisedEvacHours, {min:0, max:48, palette:['green','yellow','red']}, 'Advised evacuation time (hours)');
+
+// --------------- 10. Classify risk into Low / Moderate / High / Extreme ---------------
+var categories = floodProb.multiply(100).toInt();
+
+var riskClass = floodProb.expression(
+  "(b(0) < 0.25) ? 0" +
+  ": (b(0) < 0.5) ? 1" +
+  ": (b(0) < 0.75) ? 2 : 3",
+  {'0': floodProb}
+).rename('riskClass'); // 0:Low,1:Moderate,2:High,3:Extreme
+
+var riskPalette = ['#2b83ba','#f7fcb9','#fdae61','#d73027']; // blue, yellow, orange, red
+Map.addLayer(riskClass, {min:0, max:3, palette:riskPalette}, 'Risk level (0:Low -> 3:Extreme)');
+
+// --------------- 11. Create a combined output image with key bands ---------------
+var output = floodProb.addBands([resilience, impact, advisedEvacHours, riskClass]).rename(['floodProb','resilience','impact','evac_hours','riskClass']).clip(roi);
+
+// --------------- 12. Export / Neighborhood aggregation ---------------
+// Example: compute mean flood risk per administrative unit (if you have an admin FC). For demo we grid-aggregate:
+var grid = ee.FeatureCollection(roi).geometry().bounds().buffer(0).coveringGrid(ee.Projection('EPSG:4326'), 0.01); // 0.01 degrees ~1km
+// Convert output to mean per grid cell
+var meanPerGrid = output.reduceRegions({
+  collection: grid,
+  reducer: ee.Reducer.mean(),
+  scale: 100
+});
+
+// Print a sample of aggregated values
+print('Grid sample (impact aggregated):', meanPerGrid.limit(10));
+
+// Optional: Export map to Drive
+Export.image.toDrive({
+  image: output.select('floodProb'),
+  description: 'Mumbai_FloodProb_Demo',
+  folder: 'GEE_Exports',
+  region: roi,
+  scale: 50,
+  maxPixels: 1e9
+});
+
+// ----------------- 13. UI: Legend and simple info panel -----------------
+var legend = ui.Panel({
+  style: {position: 'bottom-left', padding: '8px 15px'}
+});
+var title = ui.Label('Flood Risk (0-1) & Risk Levels', {fontWeight: 'bold', fontSize: '14px'});
+legend.add(title);
+var makeRow = function(color, name) {
+  var colorBox = ui.Label('', {backgroundColor: color, padding: '8px', margin: '0 6px 0 0'});
+  return ui.Panel([colorBox, ui.Label(name)], ui.Panel.Layout.Flow('horizontal'));
+};
+legend.add(makeRow('#2b83ba', 'Low'));
+legend.add(makeRow('#f7fcb9', 'Moderate'));
+legend.add(makeRow('#fdae61', 'High'));
+legend.add(makeRow('#d73027', 'Extreme'));
+Map.add(legend);
+
+// Info panel
+var info = ui.Panel({
+  style: {position: 'top-right', padding: '8px 12px'}
+});
+info.add(ui.Label('FLOWSENSE Demo — Mumbai', {fontWeight:'bold', fontSize:'16px'}));
+info.add(ui.Label('FloodProb: model + heuristic. Resilience: pop/shelters/urban. Evac hrs: heuristic.'));
+Map.add(info);
+
+// End of script
